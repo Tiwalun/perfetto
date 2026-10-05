@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import {z} from 'zod';
 import {type time, Time} from '../../base/time';
+import type {App} from '../../public/app';
 import type {PerfettoPlugin} from '../../public/plugin';
+import type {Setting} from '../../public/settings';
 import type {Trace} from '../../public/trace';
-import type {Track} from '../../public/track';
+import type {Track, TrackRenderer} from '../../public/track';
 import {COUNTER_TRACK_KIND, SLICE_TRACK_KIND} from '../../public/track_kinds';
 import type {TrackNode} from '../../public/workspace';
 import TrackEventPlugin from '../dev.perfetto.TrackEvent';
@@ -28,6 +31,7 @@ import {
   logicChannelColor,
 } from './colors';
 import {LogicTrack} from './logic_track';
+import {NUM} from '../../trace_processor/query_result';
 import {
   type CaptureMeta,
   type DecoderMeta,
@@ -35,6 +39,16 @@ import {
   type SigrokMeta,
   specChannels,
 } from './metadata';
+import {
+  CaptureTrackVisibility,
+  type HiddenTracks,
+  type HiddenTracksStore,
+  type ToggleableTrack,
+  withHideButton,
+} from './visibility';
+
+// Persisted hidden tracks (per capture file name), see onActivate().
+let hiddenTracksSetting: Setting<HiddenTracks> | undefined;
 
 interface SigrokTrack {
   readonly track: Track;
@@ -58,8 +72,20 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
   static readonly dependencies = [TrackEventPlugin];
 
   private readonly logicTracks: LogicTrack[] = [];
+  private readonly visibilities: CaptureTrackVisibility[] = [];
   private activeLogic?: LogicTrack;
   private lastJump?: time;
+
+  static onActivate(app: App): void {
+    hiddenTracksSetting = app.settings.register({
+      id: `${SigrokLogicAnalyzerPlugin.id}#hiddenTracks`,
+      name: 'sigrok: hidden tracks',
+      description: 'Tracks hidden per sigrok capture file.',
+      schema: z.record(z.string(), z.array(z.string())),
+      defaultValue: {},
+      headless: true,
+    });
+  }
 
   async onTraceLoad(trace: Trace): Promise<void> {
     const tracks = this.findSigrokTracks(trace);
@@ -112,6 +138,19 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
     decoderIndex: Map<string, number>,
   ) {
     const meta = capture.meta as CaptureMeta;
+    const durationNs = (meta.samples / meta.samplerate) * 1e9;
+    const subtitle = `sigrok · ${formatFrequency(meta.samplerate)} · ${formatDuration(durationNs)}`;
+    const vis = new CaptureTrackVisibility(
+      hiddenTracksStore(),
+      meta.file,
+      () => {
+        const n = vis.hiddenKeys.length;
+        capture.node.subtitle = n > 0 ? `${subtitle} · ${n} hidden` : subtitle;
+      },
+    );
+    this.visibilities.push(vis);
+    const hideable = (t: SigrokTrack, renderer: TrackRenderer) =>
+      withHideButton(renderer, () => vis.hide(toggleable(t).key));
     const logic = tracks
       .filter((t) => t.meta.kind === 'logic')
       .sort((a, b) => metaIndex(a) - metaIndex(b));
@@ -131,7 +170,7 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
       this.logicTracks.push(renderer);
       trace.tracks.registerTrack({
         uri,
-        renderer,
+        renderer: hideable(t, renderer),
         description: `Logic channel ${t.meta.channel}${
           t.meta.derived ? ' (derived from analog by threshold)' : ''
         }`,
@@ -145,10 +184,9 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
       const uri = `/sigrok/analog/${t.trackId}`;
       trace.tracks.registerTrack({
         uri,
-        renderer: new AnalogTrack(
-          trace,
-          t.trackId,
-          analogChannelColor(position),
+        renderer: hideable(
+          t,
+          new AnalogTrack(trace, t.trackId, analogChannelColor(position)),
         ),
         description: `Analog channel ${t.meta.channel}`,
         tags: {kinds: [COUNTER_TRACK_KIND], trackIds: [t.trackId]},
@@ -162,18 +200,29 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
         const uri = `/sigrok/annotations/${t.trackId}`;
         trace.tracks.registerTrack({
           uri,
-          renderer: createAnnotationTrack({
-            trace,
-            uri,
-            trackId: t.trackId,
-            decoderIndex: decoderIndex.get(`${m.stack}/${m.instance}`) ?? 0,
-            rowIndex: m.row_index,
-          }),
+          renderer: hideable(
+            t,
+            createAnnotationTrack({
+              trace,
+              uri,
+              trackId: t.trackId,
+              decoderIndex: decoderIndex.get(`${m.stack}/${m.instance}`) ?? 0,
+              rowIndex: m.row_index,
+            }),
+          ),
           description: `${m.instance}: annotation row ${m.row}`,
           tags: {kinds: [SLICE_TRACK_KIND], trackIds: [t.trackId]},
         });
         t.node.uri = uri;
       } else if (m.kind === 'decoder') {
+        // Keep the TrackEvent plugin's group summary, plus a hide button.
+        const uri = `/sigrok/decoder/${t.trackId}`;
+        trace.tracks.registerTrack({
+          ...t.track,
+          uri,
+          renderer: hideable(t, t.track.renderer),
+        });
+        t.node.uri = uri;
         t.node.subtitle = m.longname;
         t.node.expand();
       }
@@ -228,13 +277,23 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
     for (const child of capture.node.children) {
       if (!ordered.includes(child)) ordered.push(child);
     }
-    for (const node of ordered) capture.node.removeChild(node);
-    for (const node of ordered) capture.node.addChildLast(node);
+    // Hand the order to the visibility model, which (re)inserts the nodes
+    // and leaves out hidden ones.
+    const byNode = new Map(tracks.map((t) => [t.node, t]));
+    const asToggleable = (node: TrackNode): ToggleableTrack => {
+      const t = byNode.get(node);
+      return t
+        ? toggleable(t)
+        : {key: `other:${node.id}`, label: node.name, node};
+    };
+    vis.addGroup(capture.node, ordered.map(asToggleable));
+    for (const d of tracks.filter((t) => t.meta.kind === 'decoder')) {
+      vis.addGroup(d.node, d.node.children.map(asToggleable));
+    }
+    vis.apply();
 
     // Put the capture at the top of the workspace, expanded.
-    const durationNs = (meta.samples / meta.samplerate) * 1e9;
     capture.node.name = meta.file;
-    capture.node.subtitle = `sigrok · ${formatFrequency(meta.samplerate)} · ${formatDuration(durationNs)}`;
     capture.node.remove();
     trace.defaultWorkspace.addChildFirst(capture.node);
     capture.node.expand();
@@ -281,6 +340,89 @@ export default class SigrokLogicAnalyzerPlugin implements PerfettoPlugin {
       name: 'sigrok: Collapse all decoders',
       callback: () => decoderNodes.forEach((n) => n.collapse()),
     });
+
+    const multi = this.visibilities.length > 1;
+    trace.commands.registerCommand({
+      id: `${id}#ShowHidden`,
+      name: 'sigrok: Show hidden track',
+      callback: async () => {
+        const choices = this.visibilities.flatMap((vis) =>
+          vis.hiddenTracks.map((t) => ({vis, t})),
+        );
+        if (choices.length === 0) return;
+        const choice = await trace.omnibox.prompt('Show which track?', {
+          values: choices,
+          getName: ({vis, t}) =>
+            multi ? `${vis.captureName}: ${t.label}` : t.label,
+        });
+        choice?.vis.show(choice.t.key);
+      },
+    });
+    trace.commands.registerCommand({
+      id: `${id}#ShowAllHidden`,
+      name: 'sigrok: Show all hidden tracks',
+      callback: () => this.visibilities.forEach((v) => v.showAll()),
+    });
+    trace.commands.registerCommand({
+      id: `${id}#HideIdle`,
+      name: 'sigrok: Hide logic channels without edges',
+      callback: async () => {
+        const logic = tracks.filter((t) => t.meta.kind === 'logic');
+        if (logic.length === 0) return;
+        const res = await trace.engine.query(`
+          select track_id as trackId
+          from counter
+          where track_id in (${logic.map((t) => t.trackId).join(',')})
+          group by track_id
+          having count(distinct value) <= 1
+        `);
+        const idle = new Set<number>();
+        for (const it = res.iter({trackId: NUM}); it.valid(); it.next()) {
+          idle.add(it.trackId);
+        }
+        for (const vis of this.visibilities) {
+          const keys = logic
+            .filter((t) => idle.has(t.trackId))
+            .map((t) => toggleable(t).key)
+            .filter((k) => vis.allTracks.some((v) => v.key === k));
+          vis.hide(...keys);
+        }
+      },
+    });
+  }
+}
+
+// Settings are registered in onActivate(); fall back to memory otherwise.
+function hiddenTracksStore(): HiddenTracksStore {
+  const setting = hiddenTracksSetting;
+  if (setting !== undefined) return setting;
+  let value: HiddenTracks = {};
+  return {get: () => value, set: (v) => (value = v)};
+}
+
+// Stable key and picker label of a hideable track.
+function toggleable(t: SigrokTrack): ToggleableTrack {
+  const m = t.meta;
+  const node = t.node;
+  switch (m.kind) {
+    case 'logic':
+      return {key: `logic:${m.channel}`, label: `Channel ${node.name}`, node};
+    case 'analog':
+      return {key: `analog:${m.channel}`, label: `Analog ${node.name}`, node};
+    case 'decoder':
+      return {
+        key: `decoder:${m.stack}/${m.instance}`,
+        label: `Decoder ${node.name}`,
+        node,
+      };
+    case 'annotation_row':
+      return {
+        key: `row:${m.stack}/${m.instance}/${m.row}/${m.lane}`,
+        label: `${m.instance} › ${node.name}`,
+        node,
+      };
+    case 'capture':
+      return {key: 'capture', label: node.name, node};
   }
 }
 
